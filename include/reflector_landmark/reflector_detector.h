@@ -27,7 +27,10 @@ struct ReflectorDetectorOptions {
   double max_cluster_width = 0.2;
   int min_cluster_points = 2;
   int max_cluster_points = 30;
-  int max_missing_beams = 0;
+  int max_missing_beams = 2;
+  // Merges clusters which were split by short intensity dropouts on the same
+  // physical reflector. Set to zero to disable merging.
+  double detection_merge_distance = 0.1;
 };
 
 class ReflectorDetector {

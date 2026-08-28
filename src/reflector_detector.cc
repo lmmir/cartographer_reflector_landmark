@@ -20,6 +20,42 @@ double Distance(const BeamPoint& lhs, const BeamPoint& rhs) {
   return std::hypot(lhs.x - rhs.x, lhs.y - rhs.y);
 }
 
+double Distance(const ReflectorDetection& lhs,
+                const ReflectorDetection& rhs) {
+  return std::hypot(lhs.x - rhs.x, lhs.y - rhs.y);
+}
+
+void MergeDetection(const ReflectorDetection& source,
+                    ReflectorDetection* destination) {
+  const int combined_point_count =
+      destination->point_count + source.point_count;
+  const double destination_weight =
+      static_cast<double>(destination->point_count) / combined_point_count;
+  const double source_weight =
+      static_cast<double>(source.point_count) / combined_point_count;
+  const double center_distance = Distance(*destination, source);
+
+  destination->x = destination_weight * destination->x +
+                   source_weight * source.x;
+  destination->y = destination_weight * destination->y +
+                   source_weight * source.y;
+  destination->mean_intensity =
+      destination_weight * destination->mean_intensity +
+      source_weight * source.mean_intensity;
+  // Approximate the full span of two clusters. This is deliberately
+  // conservative so a wide reflective object cannot evade max_cluster_width
+  // merely because an intensity dropout split it into smaller clusters.
+  destination->width =
+      std::max({destination->width, source.width,
+                center_distance +
+                    0.5 * (destination->width + source.width)});
+  destination->point_count = combined_point_count;
+  destination->first_beam_index =
+      std::min(destination->first_beam_index, source.first_beam_index);
+  destination->last_beam_index =
+      std::max(destination->last_beam_index, source.last_beam_index);
+}
+
 }  // namespace
 
 ReflectorDetector::ReflectorDetector(const ReflectorDetectorOptions& options)
@@ -30,7 +66,9 @@ ReflectorDetector::ReflectorDetector(const ReflectorDetectorOptions& options)
       options_.max_cluster_width < options_.min_cluster_width ||
       options_.min_cluster_points <= 0 ||
       options_.max_cluster_points < options_.min_cluster_points ||
-      options_.max_missing_beams < 0) {
+      options_.max_missing_beams < 0 ||
+      options_.detection_merge_distance < 0. ||
+      options_.detection_merge_distance > options_.max_cluster_width) {
     throw std::invalid_argument("Invalid reflector detector options.");
   }
 }
@@ -101,7 +139,39 @@ std::vector<ReflectorDetection> ReflectorDetector::Detect(
     cluster.push_back(std::move(point));
   }
   flush_cluster();
-  return detections;
+
+  if (options_.detection_merge_distance == 0. || detections.size() < 2) {
+    return detections;
+  }
+
+  std::vector<ReflectorDetection> merged_detections;
+  for (const auto& detection : detections) {
+    auto closest = merged_detections.end();
+    double closest_distance = options_.detection_merge_distance;
+    for (auto it = merged_detections.begin(); it != merged_detections.end();
+         ++it) {
+      const double distance = Distance(*it, detection);
+      if (distance <= closest_distance) {
+        closest = it;
+        closest_distance = distance;
+      }
+    }
+    if (closest == merged_detections.end()) {
+      merged_detections.push_back(detection);
+    } else {
+      MergeDetection(detection, &*closest);
+    }
+  }
+
+  merged_detections.erase(
+      std::remove_if(
+          merged_detections.begin(), merged_detections.end(),
+          [this](const ReflectorDetection& detection) {
+            return detection.width > options_.max_cluster_width ||
+                   detection.point_count > options_.max_cluster_points;
+          }),
+      merged_detections.end());
+  return merged_detections;
 }
 
 }  // namespace reflector_landmark

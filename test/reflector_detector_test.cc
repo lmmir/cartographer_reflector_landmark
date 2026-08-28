@@ -67,5 +67,52 @@ TEST(ReflectorDetectorTest, RequiresIntensityForEveryRange) {
   EXPECT_TRUE(detector.Detect(scan).empty());
 }
 
+TEST(ReflectorDetectorTest, MergesSplitClustersFromOneReflector) {
+  auto scan = MakeScan();
+  scan.ranges[48] = 2.;
+  scan.ranges[49] = 2.;
+  scan.ranges[51] = 2.;
+  scan.ranges[52] = 2.;
+  scan.intensities[48] = 1500.;
+  scan.intensities[49] = 1600.;
+  // Beam 50 deliberately stays below the intensity threshold.
+  scan.intensities[51] = 1700.;
+  scan.intensities[52] = 1800.;
+
+  ReflectorDetectorOptions options;
+  options.intensity_threshold = 1000.;
+  options.min_cluster_points = 2;
+  options.max_missing_beams = 0;
+  options.detection_merge_distance = 0.1;
+  ReflectorDetector detector(options);
+  const auto detections = detector.Detect(scan);
+
+  ASSERT_EQ(detections.size(), 1u);
+  EXPECT_EQ(detections[0].point_count, 4);
+  EXPECT_EQ(detections[0].first_beam_index, 48u);
+  EXPECT_EQ(detections[0].last_beam_index, 52u);
+  EXPECT_NEAR(detections[0].mean_intensity, 1650., 1e-6);
+}
+
+TEST(ReflectorDetectorTest, KeepsSpatiallySeparatedClusters) {
+  auto scan = MakeScan();
+  scan.ranges[20] = 2.;
+  scan.ranges[21] = 2.;
+  scan.ranges[70] = 2.;
+  scan.ranges[71] = 2.;
+  scan.intensities[20] = 1500.;
+  scan.intensities[21] = 1500.;
+  scan.intensities[70] = 1600.;
+  scan.intensities[71] = 1600.;
+
+  ReflectorDetectorOptions options;
+  options.intensity_threshold = 1000.;
+  options.min_cluster_points = 2;
+  options.detection_merge_distance = 0.1;
+  ReflectorDetector detector(options);
+
+  EXPECT_EQ(detector.Detect(scan).size(), 2u);
+}
+
 }  // namespace
 }  // namespace reflector_landmark

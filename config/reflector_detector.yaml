@@ -7,14 +7,19 @@ min_cluster_width: 0.0
 max_cluster_width: 0.20
 min_cluster_points: 2
 max_cluster_points: 30
-max_missing_beams: 0
+# Bridge short intensity dropouts and merge split clusters from one reflector.
+max_missing_beams: 2
+detection_merge_distance: 0.10
 
 # Association is performed in map_frame.
 map_frame: map
 association_distance: 0.30
 association_margin: 0.05
 pending_association_distance: 0.20
-minimum_confirmations: 3
+# Physical reflectors must be spaced farther apart than this value. Nearby
+# candidates reuse the oldest ID and can never create a second landmark.
+duplicate_suppression_distance: 0.15
+minimum_confirmations: 8
 maximum_pending_missed_scans: 5
 map_update_gain: 0.10
 

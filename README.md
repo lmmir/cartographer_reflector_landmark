@@ -73,6 +73,18 @@ rosrun cartographer_ros cartographer_node \
 First tune `config/reflector_detector.yaml` from recorded laser data. The
 default intensity threshold is only a placeholder.
 
+Duplicate-ID protection is controlled by three parameters:
+
+- `max_missing_beams` bridges a short intensity dropout inside one reflector.
+- `detection_merge_distance` merges remaining split clusters in the laser
+  frame.
+- `duplicate_suppression_distance` prevents a nearby mapping candidate from
+  creating another ID. Real reflectors must be farther apart than this value.
+
+The shipped values (`2` beams, `0.10 m`, and `0.15 m`) are conservative
+starting points. Verify them from a rosbag at the closest and farthest working
+distances before building the production map.
+
 Start the detector beside Cartographer:
 
 ```bash
@@ -153,6 +165,10 @@ Services:
 - `LaserScan.intensities` must exist and have the same length as `ranges`.
 - A physical reflector must keep the same ID. Bad associations create bad
   pose-graph constraints; uncertain detections are therefore discarded.
+- If an earlier run created many IDs at the same reflector, discard that
+  reflector YAML and pbstream and rebuild the map after applying the duplicate
+  guards. Filtering the YAML alone cannot remove the old landmark constraints
+  already stored in a pbstream.
 - Point reflectors have no reliable orientation. Keep `rotation_weight: 0.0`.
 - Plain reflectors are indistinguishable. A cold global initialization needs
   an external initial pose, encoded reflectors, or a separate constellation

@@ -118,6 +118,14 @@ class ReflectorLandmarkNode {
     ROS_INFO_STREAM("Reflector landmark node started in '" << mode_
                     << "' mode with " << reflectors_.size()
                     << " known reflectors.");
+    ROS_INFO_STREAM("Reflector duplicate guards: max_missing_beams="
+                    << detector_options_.max_missing_beams
+                    << ", detection_merge_distance="
+                    << detector_options_.detection_merge_distance
+                    << " m, duplicate_suppression_distance="
+                    << duplicate_suppression_distance_
+                    << " m, minimum_confirmations="
+                    << minimum_confirmations_ << ".");
   }
 
   ~ReflectorLandmarkNode() {
@@ -169,7 +177,10 @@ class ReflectorLandmarkNode {
     private_node_handle_.param("max_cluster_points",
                                detector_options_.max_cluster_points, 30);
     private_node_handle_.param("max_missing_beams",
-                               detector_options_.max_missing_beams, 0);
+                               detector_options_.max_missing_beams, 2);
+    private_node_handle_.param("detection_merge_distance",
+                               detector_options_.detection_merge_distance,
+                               0.1);
 
     private_node_handle_.param("association_distance", association_distance_,
                                0.3);
@@ -177,8 +188,10 @@ class ReflectorLandmarkNode {
                                0.05);
     private_node_handle_.param("pending_association_distance",
                                pending_association_distance_, 0.2);
+    private_node_handle_.param("duplicate_suppression_distance",
+                               duplicate_suppression_distance_, 0.15);
     private_node_handle_.param("minimum_confirmations",
-                               minimum_confirmations_, 3);
+                               minimum_confirmations_, 8);
     private_node_handle_.param("maximum_pending_missed_scans",
                                maximum_pending_missed_scans_, 5);
     private_node_handle_.param("map_update_gain", map_update_gain_, 0.1);
@@ -192,7 +205,9 @@ class ReflectorLandmarkNode {
     private_node_handle_.param("map_marker_scale", map_marker_scale_, 0.18);
 
     if (association_distance_ <= 0. || association_margin_ < 0. ||
-        pending_association_distance_ <= 0. || minimum_confirmations_ <= 0 ||
+        pending_association_distance_ <= 0. ||
+        duplicate_suppression_distance_ <= 0. ||
+        minimum_confirmations_ <= 0 ||
         maximum_pending_missed_scans_ < 0 || map_update_gain_ < 0. ||
         map_update_gain_ > 1. || translation_weight_ <= 0. ||
         rotation_weight_ < 0. || tf_lookup_timeout_sec_ < 0. ||
@@ -230,6 +245,15 @@ class ReflectorLandmarkNode {
                         << reflector.id << "'.");
         continue;
       }
+      const int canonical_index = FindCanonicalReflector(
+          {reflector.x, reflector.y}, duplicate_suppression_distance_);
+      if (canonical_index >= 0) {
+        ROS_WARN_STREAM(
+            "Skipping spatially duplicate reflector '" << reflector.id
+            << "' near canonical reflector '"
+            << reflectors_[canonical_index].id << "'.");
+        continue;
+      }
       double observations = 0.;
       if (ReadNumber(&value, "observations", &observations)) {
         reflector.observations = std::max(0, static_cast<int>(observations));
@@ -243,6 +267,29 @@ class ReflectorLandmarkNode {
                        [&id](const Reflector& reflector) {
                          return reflector.id == id;
                        });
+  }
+
+  // Returns the oldest matching reflector. Keeping the first ID stable is
+  // important: Cartographer treats a different landmark ID as a different
+  // pose-graph variable even when both coordinates are almost identical.
+  int FindCanonicalReflector(const MapPoint& point,
+                             const double maximum_distance) const {
+    for (std::size_t index = 0; index < reflectors_.size(); ++index) {
+      if (Distance(point, reflectors_[index]) <= maximum_distance) {
+        return static_cast<int>(index);
+      }
+    }
+    return -1;
+  }
+
+  void UpdateReflectorFromObservation(const std::size_t reflector_index,
+                                      const MapPoint& point) {
+    Reflector& reflector = reflectors_[reflector_index];
+    reflector.x = (1. - map_update_gain_) * reflector.x +
+                  map_update_gain_ * point.x;
+    reflector.y = (1. - map_update_gain_) * reflector.y +
+                  map_update_gain_ * point.y;
+    ++reflector.observations;
   }
 
   std::string GenerateReflectorId() {
@@ -348,18 +395,32 @@ class ReflectorLandmarkNode {
   void UpdateMapping(const std::vector<MapPoint>& map_points,
                      std::vector<int>* associations) {
     std::vector<bool> detection_used(map_points.size(), false);
+    std::vector<bool> reflector_used(reflectors_.size(), false);
     for (std::size_t i = 0; i < associations->size(); ++i) {
-      const int reflector_index = (*associations)[i];
+      int reflector_index = (*associations)[i];
+
+      // Mapping has a stronger duplicate guard than normal association. It
+      // also repairs the feedback loop caused by an already duplicated map:
+      // ambiguous detections are sent to the oldest nearby ID instead of
+      // becoming new pending tracks.
+      const int canonical_index = FindCanonicalReflector(
+          map_points[i], duplicate_suppression_distance_);
+      if (canonical_index >= 0) {
+        reflector_index = canonical_index;
+      }
       if (reflector_index < 0) {
         continue;
       }
       detection_used[i] = true;
-      Reflector& reflector = reflectors_[reflector_index];
-      reflector.x = (1. - map_update_gain_) * reflector.x +
-                    map_update_gain_ * map_points[i].x;
-      reflector.y = (1. - map_update_gain_) * reflector.y +
-                    map_update_gain_ * map_points[i].y;
-      ++reflector.observations;
+      if (reflector_used[reflector_index]) {
+        // A second cluster from the same physical reflector must not create a
+        // second landmark observation or a new pending track.
+        (*associations)[i] = -1;
+        continue;
+      }
+      (*associations)[i] = reflector_index;
+      reflector_used[reflector_index] = true;
+      UpdateReflectorFromObservation(reflector_index, map_points[i]);
     }
 
     std::vector<AssociationCandidate> candidates;
@@ -414,34 +475,68 @@ class ReflectorLandmarkNode {
       pending_detection.push_back(static_cast<int>(i));
     }
 
-    std::vector<std::size_t> tracks_to_remove;
+    std::vector<bool> remove_pending(pending_tracks_.size(), false);
     for (std::size_t track_index = 0; track_index < pending_tracks_.size();
          ++track_index) {
       PendingTrack& track = pending_tracks_[track_index];
       const int detection_index = pending_detection[track_index];
       if (detection_index >= 0 && track.hits >= minimum_confirmations_) {
+        const MapPoint track_point{track.x, track.y};
+        const int canonical_index = FindCanonicalReflector(
+            track_point, duplicate_suppression_distance_);
+        if (canonical_index >= 0) {
+          if (!reflector_used[canonical_index]) {
+            (*associations)[detection_index] = canonical_index;
+            reflector_used[canonical_index] = true;
+            UpdateReflectorFromObservation(canonical_index,
+                                           map_points[detection_index]);
+          }
+          remove_pending[track_index] = true;
+          ROS_WARN_STREAM_THROTTLE(
+              2., "Suppressed duplicate reflector candidate near '"
+                      << reflectors_[canonical_index].id << "'.");
+          continue;
+        }
+
         Reflector reflector;
         reflector.id = GenerateReflectorId();
         reflector.x = track.x;
         reflector.y = track.y;
         reflector.observations = track.hits;
         reflectors_.push_back(reflector);
+        reflector_used.push_back(true);
         (*associations)[detection_index] =
             static_cast<int>(reflectors_.size() - 1);
-        tracks_to_remove.push_back(track_index);
+        remove_pending[track_index] = true;
         ROS_INFO_STREAM("Created reflector '" << reflector.id << "' at ["
                         << reflector.x << ", " << reflector.y << "].");
       } else if (detection_index < 0) {
         ++track.missed_scans;
         if (track.missed_scans > maximum_pending_missed_scans_) {
-          tracks_to_remove.push_back(track_index);
+          remove_pending[track_index] = true;
         }
       }
     }
 
-    std::sort(tracks_to_remove.rbegin(), tracks_to_remove.rend());
-    for (const std::size_t index : tracks_to_remove) {
-      pending_tracks_.erase(pending_tracks_.begin() + index);
+    // A reflector created above may overlap another, less mature pending
+    // track. Remove it now so it cannot become a duplicate on a later scan.
+    for (std::size_t track_index = 0; track_index < pending_tracks_.size();
+         ++track_index) {
+      if (remove_pending[track_index]) {
+        continue;
+      }
+      if (FindCanonicalReflector(
+              {pending_tracks_[track_index].x,
+               pending_tracks_[track_index].y},
+              duplicate_suppression_distance_) >= 0) {
+        remove_pending[track_index] = true;
+      }
+    }
+
+    for (std::size_t index = pending_tracks_.size(); index-- > 0;) {
+      if (remove_pending[index]) {
+        pending_tracks_.erase(pending_tracks_.begin() + index);
+      }
     }
   }
 
@@ -673,7 +768,8 @@ class ReflectorLandmarkNode {
   double association_distance_ = 0.3;
   double association_margin_ = 0.05;
   double pending_association_distance_ = 0.2;
-  int minimum_confirmations_ = 3;
+  double duplicate_suppression_distance_ = 0.15;
+  int minimum_confirmations_ = 8;
   int maximum_pending_missed_scans_ = 5;
   double map_update_gain_ = 0.1;
   double translation_weight_ = 20.;
