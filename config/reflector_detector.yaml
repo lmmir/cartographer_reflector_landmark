@@ -1,0 +1,31 @@
+# The lidar-specific parameters below must be tuned from recorded data.
+intensity_threshold: 1000.0
+min_range: 0.2
+max_range: 20.0
+cluster_distance: 0.08
+min_cluster_width: 0.0
+max_cluster_width: 0.20
+min_cluster_points: 2
+max_cluster_points: 30
+max_missing_beams: 0
+
+# Association is performed in map_frame.
+map_frame: map
+association_distance: 0.30
+association_margin: 0.05
+pending_association_distance: 0.20
+minimum_confirmations: 3
+maximum_pending_missed_scans: 5
+map_update_gain: 0.10
+
+# Cartographer multiplies residuals by these values. A point reflector has no
+# reliable orientation, so rotation_weight must normally remain zero.
+translation_weight: 20.0
+rotation_weight: 0.0
+tf_lookup_timeout_sec: 0.05
+
+id_prefix: reflector_
+id_width: 4
+save_on_shutdown: true
+detection_marker_scale: 0.12
+map_marker_scale: 0.18

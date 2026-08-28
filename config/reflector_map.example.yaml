@@ -1,0 +1,12 @@
+map_frame: map
+reflectors:
+  - id: "reflector_0000"
+    x: 1.0
+    y: 2.0
+    z: 0.0
+    observations: 0
+  - id: "reflector_0001"
+    x: 4.0
+    y: -1.0
+    z: 0.0
+    observations: 0

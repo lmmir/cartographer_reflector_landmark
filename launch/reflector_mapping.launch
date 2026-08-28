@@ -1,0 +1,17 @@
+<launch>
+  <arg name="scan_topic" default="/scan" />
+  <arg name="landmark_topic" default="/landmark" />
+  <arg name="map_file" default="/tmp/reflector_map.yaml" />
+  <arg name="detector_config"
+       default="$(find reflector_landmark)/config/reflector_detector.yaml" />
+
+  <node pkg="reflector_landmark" type="reflector_landmark_node"
+        name="reflector_landmark" output="screen">
+    <rosparam command="load" file="$(arg detector_config)" />
+    <param name="mode" value="mapping" />
+    <param name="scan_topic" value="$(arg scan_topic)" />
+    <param name="landmark_topic" value="$(arg landmark_topic)" />
+    <param name="map_file" value="$(arg map_file)" />
+    <param name="save_on_shutdown" value="true" />
+  </node>
+</launch>

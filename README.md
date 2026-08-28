@@ -1,0 +1,159 @@
+# reflector_landmark
+
+`reflector_landmark` is an external ROS1 package that detects high-intensity
+laser reflectors and sends them to the existing Cartographer landmark input.
+It does not modify `cartographer` or `cartographer_ros`.
+
+## Data flow
+
+```text
+sensor_msgs/LaserScan
+  -> intensity filter and clustering
+  -> map-frame data association
+  -> cartographer_ros_msgs/LandmarkList
+  -> /landmark
+  -> Cartographer pose graph
+```
+
+The node has two modes:
+
+- `mapping`: tracks detections, creates stable IDs after several observations,
+  and updates an association map.
+- `localization`: loads a fixed reflector map and only publishes unambiguous
+  matches. It never creates new IDs.
+
+## Build
+
+Place the package in the same catkin source workspace as Cartographer, then:
+
+```bash
+catkin_make_isolated --install --use-ninja
+source install_isolated/setup.bash
+```
+
+The package builds three targets:
+
+- `reflector_landmark_node`: detector, associator and landmark publisher.
+- `reflector_map_exporter`: exports optimized landmark positions from a
+  pbstream into the YAML format consumed by the node.
+- `reflector_detector_test`: detector unit tests when testing is enabled.
+
+## Cartographer configuration
+
+The Cartographer trajectory must contain:
+
+```lua
+options.use_landmarks = true
+options.landmarks_sampling_ratio = 1.0
+TRAJECTORY_BUILDER.collate_landmarks = false
+```
+
+Landmarks affect the global pose graph, so reduce optimization latency if the
+CPU budget permits it:
+
+```lua
+POSE_GRAPH.optimize_every_n_nodes = 10
+```
+
+Complete integration examples are in `configuration_files/`. They are
+templates: adapt frames, laser counts, IMU/odometry use and ranges to the
+robot.
+
+Example Cartographer mapping command:
+
+```bash
+rosrun cartographer_ros cartographer_node \
+  -configuration_directory "$(rospack find reflector_landmark)/configuration_files" \
+  -configuration_basename reflector_2d_mapping.lua \
+  -save_state_filename /tmp/map_with_reflectors.pbstream
+```
+
+## Mapping
+
+First tune `config/reflector_detector.yaml` from recorded laser data. The
+default intensity threshold is only a placeholder.
+
+Start the detector beside Cartographer:
+
+```bash
+roslaunch reflector_landmark reflector_mapping.launch \
+  scan_topic:=/scan \
+  map_file:=/tmp/reflector_map_online.yaml
+```
+
+The node needs a valid `map -> <laser frame>` transform at the scan timestamp.
+It deliberately publishes no landmark when that transform is unavailable.
+
+Save the online association map on demand:
+
+```bash
+rosservice call /reflector_landmark/save_map
+```
+
+After Cartographer finishes its final optimization and writes the pbstream,
+export the optimized positions. Prefer this file over the online association
+map for subsequent localization:
+
+```bash
+rosrun reflector_landmark reflector_map_exporter \
+  /tmp/map_with_reflectors.pbstream \
+  /tmp/reflector_map.yaml \
+  map \
+  reflector_
+```
+
+The final argument filters landmark IDs. Pass an empty string to export every
+landmark in a mixed-landmark pbstream.
+
+## Localization
+
+Start Cartographer with the matching pbstream and the localization Lua file:
+
+```bash
+rosrun cartographer_ros cartographer_node \
+  -configuration_directory "$(rospack find reflector_landmark)/configuration_files" \
+  -configuration_basename reflector_2d_localization.lua \
+  -load_state_filename /tmp/map_with_reflectors.pbstream
+```
+
+Start reflector association with the exported YAML file:
+
+```bash
+roslaunch reflector_landmark reflector_localization.launch \
+  scan_topic:=/scan \
+  map_file:=/tmp/reflector_map.yaml
+```
+
+The localization associator requires a sufficiently accurate current
+`map -> laser` estimate. Use the existing initial-pose/relocation interface
+before enabling landmark association after a cold start. Global reflector-only
+RANSAC initialization is intentionally not performed by this package.
+
+## Interfaces
+
+Inputs:
+
+- `scan_topic` (`sensor_msgs/LaserScan`), default `scan`.
+- TF from the scan frame to `map_frame` at the scan timestamp.
+- private `reflectors` parameter in localization mode.
+
+Outputs:
+
+- `landmark_topic` (`cartographer_ros_msgs/LandmarkList`), default `landmark`.
+- `~detections` (`visualization_msgs/MarkerArray`): green is associated, red is
+  rejected or pending.
+- `~map` (`visualization_msgs/MarkerArray`): current reflector association map.
+
+Services:
+
+- `~save_map` (`std_srvs/Trigger`).
+
+## Important constraints
+
+- `LaserScan.intensities` must exist and have the same length as `ranges`.
+- A physical reflector must keep the same ID. Bad associations create bad
+  pose-graph constraints; uncertain detections are therefore discarded.
+- Point reflectors have no reliable orientation. Keep `rotation_weight: 0.0`.
+- Plain reflectors are indistinguishable. A cold global initialization needs
+  an external initial pose, encoded reflectors, or a separate constellation
+  matching step.
