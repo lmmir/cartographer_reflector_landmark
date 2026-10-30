@@ -13,42 +13,58 @@ struct BeamPoint {
   std::size_t index;
   double x;
   double y;
+  double z;
   double intensity;
 };
 
 double Distance(const BeamPoint& lhs, const BeamPoint& rhs) {
-  return std::hypot(lhs.x - rhs.x, lhs.y - rhs.y);
+  return std::sqrt((lhs.x - rhs.x) * (lhs.x - rhs.x) +
+                   (lhs.y - rhs.y) * (lhs.y - rhs.y) +
+                   (lhs.z - rhs.z) * (lhs.z - rhs.z));
 }
 
-double Distance(const ReflectorDetection& lhs,
-                const ReflectorDetection& rhs) {
-  return std::hypot(lhs.x - rhs.x, lhs.y - rhs.y);
+double Distance(const ReflectorDetection& lhs, const ReflectorDetection& rhs) {
+  return std::sqrt((lhs.x - rhs.x) * (lhs.x - rhs.x) +
+                   (lhs.y - rhs.y) * (lhs.y - rhs.y) +
+                   (lhs.z - rhs.z) * (lhs.z - rhs.z));
 }
 
-void MergeDetection(const ReflectorDetection& source,
-                    ReflectorDetection* destination) {
+struct DetectionCluster {
+  ReflectorDetection detection;
+  BeamPoint first;
+  BeamPoint last;
+};
+
+void MergeDetection(const DetectionCluster& source_cluster,
+                    DetectionCluster* destination_cluster) {
+  const auto& source = source_cluster.detection;
+  auto* destination = &destination_cluster->detection;
   const int combined_point_count =
       destination->point_count + source.point_count;
   const double destination_weight =
       static_cast<double>(destination->point_count) / combined_point_count;
   const double source_weight =
       static_cast<double>(source.point_count) / combined_point_count;
-  const double center_distance = Distance(*destination, source);
 
-  destination->x = destination_weight * destination->x +
-                   source_weight * source.x;
-  destination->y = destination_weight * destination->y +
-                   source_weight * source.y;
+  destination->x =
+      destination_weight * destination->x + source_weight * source.x;
+  destination->y =
+      destination_weight * destination->y + source_weight * source.y;
+  destination->z =
+      destination_weight * destination->z + source_weight * source.z;
   destination->mean_intensity =
       destination_weight * destination->mean_intensity +
       source_weight * source.mean_intensity;
-  // Approximate the full span of two clusters. This is deliberately
-  // conservative so a wide reflective object cannot evade max_cluster_width
-  // merely because an intensity dropout split it into smaller clusters.
-  destination->width =
-      std::max({destination->width, source.width,
-                center_distance +
-                    0.5 * (destination->width + source.width)});
+  if (source.first_beam_index < destination->first_beam_index) {
+    destination_cluster->first = source_cluster.first;
+  }
+  if (source.last_beam_index > destination->last_beam_index) {
+    destination_cluster->last = source_cluster.last;
+  }
+  // Keep actual endpoints: a weighted centroid need not be the span midpoint.
+  destination->width = std::max(
+      {destination->width, source.width,
+       Distance(destination_cluster->first, destination_cluster->last)});
   destination->point_count = combined_point_count;
   destination->first_beam_index =
       std::min(destination->first_beam_index, source.first_beam_index);
@@ -74,28 +90,21 @@ ReflectorDetector::ReflectorDetector(const ReflectorDetectorOptions& options)
 }
 
 std::vector<ReflectorDetection> ReflectorDetector::Detect(
-    const sensor_msgs::LaserScan& scan) const {
+    const sensor_msgs::LaserScan& scan,
+    const BeamTransform& beam_transform) const {
   std::vector<ReflectorDetection> detections;
   if (scan.ranges.empty() || scan.intensities.size() != scan.ranges.size()) {
     return detections;
   }
 
+  std::vector<DetectionCluster> candidate_clusters;
   std::vector<BeamPoint> cluster;
   const auto flush_cluster = [&]() {
-    if (cluster.size() <
-            static_cast<std::size_t>(options_.min_cluster_points) ||
-        cluster.size() >
-            static_cast<std::size_t>(options_.max_cluster_points)) {
-      cluster.clear();
+    if (cluster.empty()) {
       return;
     }
 
     const double width = Distance(cluster.front(), cluster.back());
-    if (width < options_.min_cluster_width ||
-        width > options_.max_cluster_width) {
-      cluster.clear();
-      return;
-    }
 
     ReflectorDetection detection;
     detection.width = width;
@@ -105,13 +114,15 @@ std::vector<ReflectorDetection> ReflectorDetector::Detect(
     for (const auto& point : cluster) {
       detection.x += point.x;
       detection.y += point.y;
+      detection.z += point.z;
       detection.mean_intensity += point.intensity;
     }
     const double count = static_cast<double>(cluster.size());
     detection.x /= count;
     detection.y /= count;
+    detection.z /= count;
     detection.mean_intensity /= count;
-    detections.push_back(detection);
+    candidate_clusters.push_back({detection, cluster.front(), cluster.back()});
     cluster.clear();
   };
 
@@ -126,8 +137,15 @@ std::vector<ReflectorDetection> ReflectorDetector::Detect(
     }
 
     const double angle = scan.angle_min + i * scan.angle_increment;
-    BeamPoint point{i, range * std::cos(angle), range * std::sin(angle),
-                    intensity};
+    BeamPosition position{range * std::cos(angle), range * std::sin(angle), 0.};
+    if (beam_transform) {
+      position = beam_transform(i, position);
+    }
+    if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
+        !std::isfinite(position.z)) {
+      continue;
+    }
+    BeamPoint point{i, position.x, position.y, position.z, intensity};
     if (!cluster.empty()) {
       const std::size_t missing_beams = i - cluster.back().index - 1;
       if (missing_beams >
@@ -140,38 +158,37 @@ std::vector<ReflectorDetection> ReflectorDetector::Detect(
   }
   flush_cluster();
 
-  if (options_.detection_merge_distance == 0. || detections.size() < 2) {
-    return detections;
-  }
-
-  std::vector<ReflectorDetection> merged_detections;
-  for (const auto& detection : detections) {
-    auto closest = merged_detections.end();
+  std::vector<DetectionCluster> merged_clusters;
+  for (const auto& candidate : candidate_clusters) {
+    auto closest = merged_clusters.end();
     double closest_distance = options_.detection_merge_distance;
-    for (auto it = merged_detections.begin(); it != merged_detections.end();
-         ++it) {
-      const double distance = Distance(*it, detection);
-      if (distance <= closest_distance) {
+    for (auto it = merged_clusters.begin(); it != merged_clusters.end(); ++it) {
+      const double distance = Distance(it->detection, candidate.detection);
+      if (options_.detection_merge_distance > 0. &&
+          distance <= closest_distance) {
         closest = it;
         closest_distance = distance;
       }
     }
-    if (closest == merged_detections.end()) {
-      merged_detections.push_back(detection);
+    if (closest == merged_clusters.end()) {
+      merged_clusters.push_back(candidate);
     } else {
-      MergeDetection(detection, &*closest);
+      MergeDetection(candidate, &*closest);
     }
   }
 
-  merged_detections.erase(
-      std::remove_if(
-          merged_detections.begin(), merged_detections.end(),
-          [this](const ReflectorDetection& detection) {
-            return detection.width > options_.max_cluster_width ||
-                   detection.point_count > options_.max_cluster_points;
-          }),
-      merged_detections.end());
-  return merged_detections;
+  // Filtering here lets adjacent single-beam fragments satisfy the minimum
+  // together, and still rejects overly wide/large merged reflective objects.
+  for (const auto& merged : merged_clusters) {
+    const auto& detection = merged.detection;
+    if (detection.point_count >= options_.min_cluster_points &&
+        detection.point_count <= options_.max_cluster_points &&
+        detection.width >= options_.min_cluster_width &&
+        detection.width <= options_.max_cluster_width) {
+      detections.push_back(detection);
+    }
+  }
+  return detections;
 }
 
 }  // namespace reflector_landmark

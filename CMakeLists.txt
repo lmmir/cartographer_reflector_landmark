@@ -31,7 +31,7 @@ find_package(cartographer REQUIRED)
 
 catkin_package(
   INCLUDE_DIRS include
-  LIBRARIES reflector_detector
+  LIBRARIES reflector_detector reflector_map
   CATKIN_DEPENDS
     cartographer_ros_msgs
     geometry_msgs
@@ -56,11 +56,14 @@ add_library(reflector_detector
 target_link_libraries(reflector_detector ${catkin_LIBRARIES})
 add_dependencies(reflector_detector ${catkin_EXPORTED_TARGETS})
 
+add_library(reflector_map src/reflector_map.cc)
+
 add_executable(reflector_landmark_node
   src/reflector_landmark_node.cc
 )
 target_link_libraries(reflector_landmark_node
   reflector_detector
+  reflector_map
   ${catkin_LIBRARIES}
 )
 add_dependencies(reflector_landmark_node ${catkin_EXPORTED_TARGETS})
@@ -71,6 +74,12 @@ add_executable(reflector_map_exporter
 target_link_libraries(reflector_map_exporter cartographer)
 
 if(CATKIN_ENABLE_TESTING)
+  add_executable(reflector_regression_test test/reflector_regression_test.cc)
+  target_link_libraries(reflector_regression_test
+    reflector_detector reflector_map ${catkin_LIBRARIES})
+  add_dependencies(reflector_regression_test ${catkin_EXPORTED_TARGETS})
+  add_test(NAME reflector_regression_test COMMAND reflector_regression_test)
+
   catkin_add_gtest(reflector_detector_test
     test/reflector_detector_test.cc
   )
@@ -84,6 +93,7 @@ endif()
 
 install(TARGETS
   reflector_detector
+  reflector_map
   reflector_landmark_node
   reflector_map_exporter
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}

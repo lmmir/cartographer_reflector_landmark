@@ -5,22 +5,22 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
-#include <sstream>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "XmlRpcValue.h"
 #include "cartographer_ros_msgs/LandmarkEntry.h"
 #include "cartographer_ros_msgs/LandmarkList.h"
-#include "geometry_msgs/PointStamped.h"
 #include "geometry_msgs/TransformStamped.h"
 #include "reflector_landmark/reflector_detector.h"
+#include "reflector_landmark/reflector_map.h"
 #include "ros/ros.h"
 #include "sensor_msgs/LaserScan.h"
 #include "std_srvs/Trigger.h"
+#include "tf2/LinearMath/Transform.h"
 #include "tf2/exceptions.h"
+#include "tf2/utils.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.h"
 #include "tf2_ros/transform_listener.h"
 #include "visualization_msgs/Marker.h"
@@ -28,39 +28,6 @@
 
 namespace reflector_landmark {
 namespace {
-
-struct MapPoint {
-  double x = 0.;
-  double y = 0.;
-};
-
-struct Reflector {
-  std::string id;
-  double x = 0.;
-  double y = 0.;
-  int observations = 0;
-};
-
-struct PendingTrack {
-  double x = 0.;
-  double y = 0.;
-  int hits = 0;
-  int missed_scans = 0;
-};
-
-struct AssociationCandidate {
-  std::size_t detection_index;
-  std::size_t target_index;
-  double distance;
-};
-
-double Distance(const MapPoint& point, const Reflector& reflector) {
-  return std::hypot(point.x - reflector.x, point.y - reflector.y);
-}
-
-double Distance(const MapPoint& point, const PendingTrack& track) {
-  return std::hypot(point.x - track.x, point.y - track.y);
-}
 
 std::string EscapeYamlString(const std::string& value) {
   std::string escaped;
@@ -96,44 +63,62 @@ bool ReadNumber(XmlRpc::XmlRpcValue* object, const std::string& key,
 class ReflectorLandmarkNode {
  public:
   ReflectorLandmarkNode()
-      : node_handle_(),
-        private_node_handle_("~"),
-        tf_listener_(tf_buffer_) {
+      : node_handle_(), private_node_handle_("~"), tf_listener_(tf_buffer_) {
     LoadParameters();
     detector_.reset(new ReflectorDetector(detector_options_));
+    ReflectorMapOptions map_options;
+    map_options.association_distance = association_distance_;
+    map_options.association_margin = association_margin_;
+    map_options.pending_association_distance = pending_association_distance_;
+    map_options.duplicate_suppression_distance =
+        duplicate_suppression_distance_;
+    map_options.minimum_confirmations = minimum_confirmations_;
+    map_options.maximum_pending_missed_scans = maximum_pending_missed_scans_;
+    map_options.map_update_gain = map_update_gain_;
+    map_options.id_prefix = id_prefix_;
+    map_options.id_width = id_width_;
+    reflector_map_.reset(new ReflectorMap(map_options));
     LoadReflectorsFromParameters();
 
-    landmark_publisher_ = node_handle_.advertise<
-        cartographer_ros_msgs::LandmarkList>(landmark_topic_, 10);
-    detection_marker_publisher_ = private_node_handle_.advertise<
-        visualization_msgs::MarkerArray>("detections", 1);
-    map_marker_publisher_ = private_node_handle_.advertise<
-        visualization_msgs::MarkerArray>("map", 1, true);
+    landmark_publisher_ =
+        node_handle_.advertise<cartographer_ros_msgs::LandmarkList>(
+            landmark_topic_, 10);
+    detection_marker_publisher_ =
+        private_node_handle_.advertise<visualization_msgs::MarkerArray>(
+            "detections", 1);
+    map_marker_publisher_ =
+        private_node_handle_.advertise<visualization_msgs::MarkerArray>(
+            "map", 1, true);
     save_map_service_ = private_node_handle_.advertiseService(
         "save_map", &ReflectorLandmarkNode::HandleSaveMap, this);
+    if (mapping_mode_) {
+      optimized_landmark_subscriber_ = node_handle_.subscribe(
+          optimized_landmark_topic_, 1,
+          &ReflectorLandmarkNode::HandleOptimizedLandmarks, this);
+    }
     scan_subscriber_ = node_handle_.subscribe(
         scan_topic_, 10, &ReflectorLandmarkNode::HandleScan, this);
 
     PublishMapMarkers(ros::Time::now());
-    ROS_INFO_STREAM("Reflector landmark node started in '" << mode_
-                    << "' mode with " << reflectors_.size()
+    ROS_INFO_STREAM("Reflector landmark node started in '"
+                    << mode_ << "' mode with "
+                    << reflector_map_->reflectors().size()
                     << " known reflectors.");
-    ROS_INFO_STREAM("Reflector duplicate guards: max_missing_beams="
-                    << detector_options_.max_missing_beams
-                    << ", detection_merge_distance="
-                    << detector_options_.detection_merge_distance
-                    << " m, duplicate_suppression_distance="
-                    << duplicate_suppression_distance_
-                    << " m, minimum_confirmations="
-                    << minimum_confirmations_ << ".");
+    ROS_INFO_STREAM(
+        "Reflector duplicate guards: max_missing_beams="
+        << detector_options_.max_missing_beams << ", detection_merge_distance="
+        << detector_options_.detection_merge_distance
+        << " m, duplicate_suppression_distance="
+        << duplicate_suppression_distance_
+        << " m, minimum_confirmations=" << minimum_confirmations_ << ".");
   }
 
   ~ReflectorLandmarkNode() {
     if (mapping_mode_ && save_on_shutdown_ && !map_file_.empty()) {
       std::string error;
       if (!SaveReflectorMap(&error)) {
-        ROS_ERROR_STREAM("Could not save reflector map during shutdown: "
-                         << error);
+        ROS_ERROR_STREAM(
+            "Could not save reflector map during shutdown: " << error);
       }
     }
   }
@@ -151,14 +136,18 @@ class ReflectorLandmarkNode {
     }
     mapping_mode_ = mode_ == "mapping";
 
-    private_node_handle_.param<std::string>("scan_topic", scan_topic_,
-                                             "scan");
+    private_node_handle_.param<std::string>("scan_topic", scan_topic_, "scan");
     private_node_handle_.param<std::string>("landmark_topic", landmark_topic_,
-                                             "landmark");
+                                            "landmark");
     private_node_handle_.param<std::string>("map_frame", map_frame_, "map");
+    private_node_handle_.param<std::string>("local_frame", local_frame_,
+                                            "odom");
+    private_node_handle_.param<std::string>("optimized_landmark_topic",
+                                            optimized_landmark_topic_,
+                                            "/landmark_poses_list");
     private_node_handle_.param<std::string>("map_file", map_file_, "");
     private_node_handle_.param<std::string>("id_prefix", id_prefix_,
-                                             "reflector_");
+                                            "reflector_");
     private_node_handle_.param("id_width", id_width_, 4);
     private_node_handle_.param("save_on_shutdown", save_on_shutdown_, true);
 
@@ -179,24 +168,21 @@ class ReflectorLandmarkNode {
     private_node_handle_.param("max_missing_beams",
                                detector_options_.max_missing_beams, 2);
     private_node_handle_.param("detection_merge_distance",
-                               detector_options_.detection_merge_distance,
-                               0.1);
+                               detector_options_.detection_merge_distance, 0.1);
 
     private_node_handle_.param("association_distance", association_distance_,
                                0.3);
-    private_node_handle_.param("association_margin", association_margin_,
-                               0.05);
+    private_node_handle_.param("association_margin", association_margin_, 0.05);
     private_node_handle_.param("pending_association_distance",
                                pending_association_distance_, 0.2);
     private_node_handle_.param("duplicate_suppression_distance",
                                duplicate_suppression_distance_, 0.15);
-    private_node_handle_.param("minimum_confirmations",
-                               minimum_confirmations_, 8);
+    private_node_handle_.param("minimum_confirmations", minimum_confirmations_,
+                               8);
     private_node_handle_.param("maximum_pending_missed_scans",
                                maximum_pending_missed_scans_, 5);
     private_node_handle_.param("map_update_gain", map_update_gain_, 0.1);
-    private_node_handle_.param("translation_weight", translation_weight_,
-                               20.);
+    private_node_handle_.param("translation_weight", translation_weight_, 20.);
     private_node_handle_.param("rotation_weight", rotation_weight_, 0.);
     private_node_handle_.param("tf_lookup_timeout_sec", tf_lookup_timeout_sec_,
                                0.05);
@@ -204,10 +190,15 @@ class ReflectorLandmarkNode {
                                detection_marker_scale_, 0.12);
     private_node_handle_.param("map_marker_scale", map_marker_scale_, 0.18);
 
+    if (map_frame_.empty() || local_frame_.empty() ||
+        map_frame_ == local_frame_) {
+      throw std::runtime_error(
+          "Parameters '~map_frame' and '~local_frame' must be nonempty and "
+          "distinct; '~local_frame' must be a continuous odometry frame.");
+    }
     if (association_distance_ <= 0. || association_margin_ < 0. ||
         pending_association_distance_ <= 0. ||
-        duplicate_suppression_distance_ <= 0. ||
-        minimum_confirmations_ <= 0 ||
+        duplicate_suppression_distance_ <= 0. || minimum_confirmations_ <= 0 ||
         maximum_pending_missed_scans_ < 0 || map_update_gain_ < 0. ||
         map_update_gain_ > 1. || translation_weight_ <= 0. ||
         rotation_weight_ < 0. || tf_lookup_timeout_sec_ < 0. ||
@@ -239,324 +230,149 @@ class ReflectorLandmarkNode {
       Reflector reflector;
       reflector.id = static_cast<std::string>(value["id"]);
       if (!ReadNumber(&value, "x", &reflector.x) ||
-          !ReadNumber(&value, "y", &reflector.y) ||
-          HasReflectorId(reflector.id)) {
+          !ReadNumber(&value, "y", &reflector.y) || reflector.id.empty() ||
+          !std::isfinite(reflector.x) || !std::isfinite(reflector.y) ||
+          reflector_map_->HasReflectorId(reflector.id)) {
         ROS_WARN_STREAM("Skipping invalid or duplicate reflector '"
                         << reflector.id << "'.");
         continue;
       }
-      const int canonical_index = FindCanonicalReflector(
+      const int canonical_index = reflector_map_->FindCanonicalReflector(
           {reflector.x, reflector.y}, duplicate_suppression_distance_);
       if (canonical_index >= 0) {
-        ROS_WARN_STREAM(
-            "Skipping spatially duplicate reflector '" << reflector.id
-            << "' near canonical reflector '"
-            << reflectors_[canonical_index].id << "'.");
+        ROS_WARN_STREAM("Skipping spatially duplicate reflector '"
+                        << reflector.id << "' near canonical reflector '"
+                        << reflector_map_->reflectors()[canonical_index].id
+                        << "'.");
         continue;
       }
       double observations = 0.;
-      if (ReadNumber(&value, "observations", &observations)) {
+      if (ReadNumber(&value, "observations", &observations) &&
+          std::isfinite(observations) && observations >= 0. &&
+          observations <= std::numeric_limits<int>::max()) {
         reflector.observations = std::max(0, static_cast<int>(observations));
       }
-      reflectors_.push_back(reflector);
+      reflector_map_->AddReflector(reflector);
     }
   }
 
-  bool HasReflectorId(const std::string& id) const {
-    return std::any_of(reflectors_.begin(), reflectors_.end(),
-                       [&id](const Reflector& reflector) {
-                         return reflector.id == id;
-                       });
-  }
-
-  // Returns the oldest matching reflector. Keeping the first ID stable is
-  // important: Cartographer treats a different landmark ID as a different
-  // pose-graph variable even when both coordinates are almost identical.
-  int FindCanonicalReflector(const MapPoint& point,
-                             const double maximum_distance) const {
-    for (std::size_t index = 0; index < reflectors_.size(); ++index) {
-      if (Distance(point, reflectors_[index]) <= maximum_distance) {
-        return static_cast<int>(index);
+  void UpdateMapFrame() {
+    // Use the latest global correction with historical local poses. Looking
+    // up map->laser at the old scan stamp would mix optimization epochs when
+    // optimized landmark poses have already advanced to the current map.
+    const auto transform =
+        tf_buffer_.lookupTransform(map_frame_, local_frame_, ros::Time(0),
+                                   ros::Duration(tf_lookup_timeout_sec_));
+    tf2::Transform map_from_local;
+    tf2::fromMsg(transform.transform, map_from_local);
+    if (have_map_frame_ && mapping_mode_) {
+      const tf2::Transform correction =
+          map_from_local * map_from_local_.inverse();
+      if (correction.getOrigin().length() > 1e-6 ||
+          correction.getRotation().getAngleShortestPath() > 1e-6) {
+        reflector_map_->RebaseUnoptimizedState(
+            correction.getOrigin().x(), correction.getOrigin().y(),
+            tf2::getYaw(correction.getRotation()));
+        map_correction_stamp_ = transform.header.stamp;
+        // Optimized landmarks need a new authoritative snapshot; merely
+        // translating their old poses cannot account for map deformation.
+        waiting_for_optimized_map_ = waiting_for_optimized_map_ ||
+                                     reflector_map_->HasOptimizedReflectors();
       }
     }
-    return -1;
+    map_from_local_ = map_from_local;
+    have_map_frame_ = true;
   }
 
-  void UpdateReflectorFromObservation(const std::size_t reflector_index,
-                                      const MapPoint& point) {
-    Reflector& reflector = reflectors_[reflector_index];
-    reflector.x = (1. - map_update_gain_) * reflector.x +
-                  map_update_gain_ * point.x;
-    reflector.y = (1. - map_update_gain_) * reflector.y +
-                  map_update_gain_ * point.y;
-    ++reflector.observations;
-  }
-
-  std::string GenerateReflectorId() {
-    while (true) {
-      std::ostringstream stream;
-      stream << id_prefix_ << std::setfill('0') << std::setw(id_width_)
-             << next_reflector_id_++;
-      if (!HasReflectorId(stream.str())) {
-        return stream.str();
+  void HandleOptimizedLandmarks(
+      const visualization_msgs::MarkerArray::ConstPtr& message) {
+    std::vector<Reflector> optimized;
+    ros::Time stamp;
+    for (const auto& marker : message->markers) {
+      if (marker.ns != "Landmarks" ||
+          marker.action != visualization_msgs::Marker::ADD) {
+        continue;
       }
+      if (marker.text.empty()) {
+        waiting_for_optimized_map_ = true;
+        ROS_ERROR_THROTTLE(
+            5.,
+            "Optimized landmark markers lack string IDs. Rebuild "
+            "cartographer_ros with the landmark marker.text change.");
+        return;
+      }
+      if (marker.header.frame_id != map_frame_ ||
+          !std::isfinite(marker.pose.position.x) ||
+          !std::isfinite(marker.pose.position.y)) {
+        ROS_WARN_THROTTLE(5., "Ignoring invalid optimized landmark snapshot.");
+        return;
+      }
+      if (!optimized.empty() && marker.header.stamp != stamp) {
+        return;
+      }
+      stamp = marker.header.stamp;
+      optimized.push_back({marker.text, marker.pose.position.x,
+                           marker.pose.position.y, 0, true});
     }
-  }
-
-  bool TransformToMap(
-      const sensor_msgs::LaserScan& scan,
-      const std::vector<ReflectorDetection>& detections,
-      std::vector<MapPoint>* map_points) {
-    geometry_msgs::TransformStamped map_from_scan;
+    if (optimized.empty()) {
+      return;
+    }
     try {
-      map_from_scan = tf_buffer_.lookupTransform(
-          map_frame_, scan.header.frame_id, scan.header.stamp,
-          ros::Duration(tf_lookup_timeout_sec_));
+      // Wait for TF to cover the snapshot time, then reject a snapshot from
+      // an older correction. TF has its own listener thread during this wait.
+      const auto snapshot_transform =
+          tf_buffer_.lookupTransform(map_frame_, local_frame_, stamp,
+                                     ros::Duration(tf_lookup_timeout_sec_));
+      UpdateMapFrame();
+      tf2::Transform snapshot_map_from_local;
+      tf2::fromMsg(snapshot_transform.transform, snapshot_map_from_local);
+      const tf2::Transform difference =
+          map_from_local_ * snapshot_map_from_local.inverse();
+      if (stamp < map_correction_stamp_ || stamp < optimized_map_stamp_ ||
+          difference.getOrigin().length() > 1e-6 ||
+          difference.getRotation().getAngleShortestPath() > 1e-6) {
+        return;
+      }
     } catch (const tf2::TransformException& error) {
-      ROS_WARN_THROTTLE(1., "Cannot transform reflector detections to %s: %s",
-                        map_frame_.c_str(), error.what());
-      return false;
+      ROS_WARN_THROTTLE(1., "Cannot synchronize optimized reflectors: %s",
+                        error.what());
+      return;
     }
-
-    map_points->clear();
-    map_points->reserve(detections.size());
-    for (const auto& detection : detections) {
-      geometry_msgs::PointStamped point_in_scan;
-      point_in_scan.header = scan.header;
-      point_in_scan.point.x = detection.x;
-      point_in_scan.point.y = detection.y;
-      point_in_scan.point.z = 0.;
-      geometry_msgs::PointStamped point_in_map;
-      tf2::doTransform(point_in_scan, point_in_map, map_from_scan);
-      map_points->push_back({point_in_map.point.x, point_in_map.point.y});
-    }
-    return true;
+    reflector_map_->SynchronizeOptimizedReflectors(optimized);
+    optimized_map_stamp_ = stamp;
+    waiting_for_optimized_map_ = false;
+    PublishMapMarkers(stamp);
   }
 
-  std::vector<int> AssociateKnownReflectors(
-      const std::vector<MapPoint>& map_points) const {
-    std::vector<int> associations(map_points.size(), -1);
-    if (reflectors_.empty()) {
-      return associations;
-    }
-
-    std::vector<double> best_distance(
-        map_points.size(), std::numeric_limits<double>::infinity());
-    std::vector<double> second_best_distance(
-        map_points.size(), std::numeric_limits<double>::infinity());
-    std::vector<std::size_t> best_reflector_index(
-        map_points.size(), reflectors_.size());
-    std::vector<AssociationCandidate> candidates;
-    for (std::size_t detection_index = 0;
-         detection_index < map_points.size(); ++detection_index) {
-      for (std::size_t reflector_index = 0;
-           reflector_index < reflectors_.size(); ++reflector_index) {
-        const double distance = Distance(map_points[detection_index],
-                                         reflectors_[reflector_index]);
-        if (distance < best_distance[detection_index]) {
-          second_best_distance[detection_index] =
-              best_distance[detection_index];
-          best_distance[detection_index] = distance;
-          best_reflector_index[detection_index] = reflector_index;
-        } else if (distance < second_best_distance[detection_index]) {
-          second_best_distance[detection_index] = distance;
-        }
-      }
-      const double second_best = second_best_distance[detection_index];
-      const bool ambiguous =
-          std::isfinite(second_best) &&
-          second_best - best_distance[detection_index] < association_margin_;
-      if (!ambiguous && best_distance[detection_index] <=
-                            association_distance_) {
-        candidates.push_back({detection_index,
-                              best_reflector_index[detection_index],
-                              best_distance[detection_index]});
-      }
-    }
-    std::sort(candidates.begin(), candidates.end(),
-              [](const AssociationCandidate& lhs,
-                 const AssociationCandidate& rhs) {
-                return lhs.distance < rhs.distance;
-              });
-
-    std::vector<bool> used_reflectors(reflectors_.size(), false);
-    for (const auto& candidate : candidates) {
-      if (associations[candidate.detection_index] >= 0 ||
-          used_reflectors[candidate.target_index]) {
-        continue;
-      }
-      associations[candidate.detection_index] =
-          static_cast<int>(candidate.target_index);
-      used_reflectors[candidate.target_index] = true;
-    }
-    return associations;
-  }
-
-  void UpdateMapping(const std::vector<MapPoint>& map_points,
-                     std::vector<int>* associations) {
-    std::vector<bool> detection_used(map_points.size(), false);
-    std::vector<bool> reflector_used(reflectors_.size(), false);
-    for (std::size_t i = 0; i < associations->size(); ++i) {
-      int reflector_index = (*associations)[i];
-
-      // Mapping has a stronger duplicate guard than normal association. It
-      // also repairs the feedback loop caused by an already duplicated map:
-      // ambiguous detections are sent to the oldest nearby ID instead of
-      // becoming new pending tracks.
-      const int canonical_index = FindCanonicalReflector(
-          map_points[i], duplicate_suppression_distance_);
-      if (canonical_index >= 0) {
-        reflector_index = canonical_index;
-      }
-      if (reflector_index < 0) {
-        continue;
-      }
-      detection_used[i] = true;
-      if (reflector_used[reflector_index]) {
-        // A second cluster from the same physical reflector must not create a
-        // second landmark observation or a new pending track.
-        (*associations)[i] = -1;
-        continue;
-      }
-      (*associations)[i] = reflector_index;
-      reflector_used[reflector_index] = true;
-      UpdateReflectorFromObservation(reflector_index, map_points[i]);
-    }
-
-    std::vector<AssociationCandidate> candidates;
-    for (std::size_t detection_index = 0;
-         detection_index < map_points.size(); ++detection_index) {
-      if (detection_used[detection_index]) {
-        continue;
-      }
-      double best_distance = pending_association_distance_;
-      std::size_t best_track_index = pending_tracks_.size();
-      for (std::size_t track_index = 0; track_index < pending_tracks_.size();
-           ++track_index) {
-        const double distance =
-            Distance(map_points[detection_index], pending_tracks_[track_index]);
-        if (distance <= best_distance) {
-          best_distance = distance;
-          best_track_index = track_index;
-        }
-      }
-      if (best_track_index < pending_tracks_.size()) {
-        candidates.push_back(
-            {detection_index, best_track_index, best_distance});
-      }
-    }
-    std::sort(candidates.begin(), candidates.end(),
-              [](const AssociationCandidate& lhs,
-                 const AssociationCandidate& rhs) {
-                return lhs.distance < rhs.distance;
-              });
-
-    std::vector<int> pending_detection(pending_tracks_.size(), -1);
-    for (const auto& candidate : candidates) {
-      if (detection_used[candidate.detection_index] ||
-          pending_detection[candidate.target_index] >= 0) {
-        continue;
-      }
-      detection_used[candidate.detection_index] = true;
-      pending_detection[candidate.target_index] =
-          static_cast<int>(candidate.detection_index);
-      PendingTrack& track = pending_tracks_[candidate.target_index];
-      track.x = 0.5 * track.x + 0.5 * map_points[candidate.detection_index].x;
-      track.y = 0.5 * track.y + 0.5 * map_points[candidate.detection_index].y;
-      ++track.hits;
-      track.missed_scans = 0;
-    }
-
-    for (std::size_t i = 0; i < map_points.size(); ++i) {
-      if (detection_used[i]) {
-        continue;
-      }
-      pending_tracks_.push_back({map_points[i].x, map_points[i].y, 1, 0});
-      pending_detection.push_back(static_cast<int>(i));
-    }
-
-    std::vector<bool> remove_pending(pending_tracks_.size(), false);
-    for (std::size_t track_index = 0; track_index < pending_tracks_.size();
-         ++track_index) {
-      PendingTrack& track = pending_tracks_[track_index];
-      const int detection_index = pending_detection[track_index];
-      if (detection_index >= 0 && track.hits >= minimum_confirmations_) {
-        const MapPoint track_point{track.x, track.y};
-        const int canonical_index = FindCanonicalReflector(
-            track_point, duplicate_suppression_distance_);
-        if (canonical_index >= 0) {
-          if (!reflector_used[canonical_index]) {
-            (*associations)[detection_index] = canonical_index;
-            reflector_used[canonical_index] = true;
-            UpdateReflectorFromObservation(canonical_index,
-                                           map_points[detection_index]);
+  std::vector<ReflectorDetection> DetectDeskewed(
+      const sensor_msgs::LaserScan& scan, tf2::Transform* local_from_scan) {
+    const auto reference = tf_buffer_.lookupTransform(
+        local_frame_, scan.header.frame_id, scan.header.stamp,
+        ros::Duration(tf_lookup_timeout_sec_));
+    tf2::fromMsg(reference.transform, *local_from_scan);
+    const tf2::Transform scan_from_local = local_from_scan->inverse();
+    return detector_->Detect(
+        scan, [&](const std::size_t index, const BeamPosition& point) {
+          if (index == 0 || scan.time_increment == 0.f) {
+            return point;
           }
-          remove_pending[track_index] = true;
-          ROS_WARN_STREAM_THROTTLE(
-              2., "Suppressed duplicate reflector candidate near '"
-                      << reflectors_[canonical_index].id << "'.");
-          continue;
-        }
-
-        Reflector reflector;
-        reflector.id = GenerateReflectorId();
-        reflector.x = track.x;
-        reflector.y = track.y;
-        reflector.observations = track.hits;
-        reflectors_.push_back(reflector);
-        reflector_used.push_back(true);
-        (*associations)[detection_index] =
-            static_cast<int>(reflectors_.size() - 1);
-        remove_pending[track_index] = true;
-        ROS_INFO_STREAM("Created reflector '" << reflector.id << "' at ["
-                        << reflector.x << ", " << reflector.y << "].");
-      } else if (detection_index < 0) {
-        ++track.missed_scans;
-        if (track.missed_scans > maximum_pending_missed_scans_) {
-          remove_pending[track_index] = true;
-        }
-      }
-    }
-
-    // A reflector created above may overlap another, less mature pending
-    // track. Remove it now so it cannot become a duplicate on a later scan.
-    for (std::size_t track_index = 0; track_index < pending_tracks_.size();
-         ++track_index) {
-      if (remove_pending[track_index]) {
-        continue;
-      }
-      if (FindCanonicalReflector(
-              {pending_tracks_[track_index].x,
-               pending_tracks_[track_index].y},
-              duplicate_suppression_distance_) >= 0) {
-        remove_pending[track_index] = true;
-      }
-    }
-
-    for (std::size_t index = pending_tracks_.size(); index-- > 0;) {
-      if (remove_pending[index]) {
-        pending_tracks_.erase(pending_tracks_.begin() + index);
-      }
-    }
+          const ros::Time beam_stamp =
+              scan.header.stamp +
+              ros::Duration(index * static_cast<double>(scan.time_increment));
+          const auto beam_transform = tf_buffer_.lookupTransform(
+              local_frame_, scan.header.frame_id, beam_stamp,
+              ros::Duration(tf_lookup_timeout_sec_));
+          tf2::Transform local_from_beam;
+          tf2::fromMsg(beam_transform.transform, local_from_beam);
+          const tf2::Vector3 deskewed = scan_from_local * local_from_beam *
+                                        tf2::Vector3(point.x, point.y, point.z);
+          return BeamPosition{deskewed.x(), deskewed.y(), deskewed.z()};
+        });
   }
 
-  void AgePendingTracks() {
-    for (auto& track : pending_tracks_) {
-      ++track.missed_scans;
-    }
-    pending_tracks_.erase(
-        std::remove_if(pending_tracks_.begin(), pending_tracks_.end(),
-                       [this](const PendingTrack& track) {
-                         return track.missed_scans >
-                                maximum_pending_missed_scans_;
-                       }),
-        pending_tracks_.end());
-  }
-
-  void PublishLandmarks(
-      const sensor_msgs::LaserScan& scan,
-      const std::vector<ReflectorDetection>& detections,
-      const std::vector<int>& associations) {
+  void PublishLandmarks(const sensor_msgs::LaserScan& scan,
+                        const std::vector<ReflectorDetection>& detections,
+                        const std::vector<int>& associations) {
     cartographer_ros_msgs::LandmarkList message;
     message.header = scan.header;
     for (std::size_t i = 0; i < associations.size(); ++i) {
@@ -564,10 +380,10 @@ class ReflectorLandmarkNode {
         continue;
       }
       cartographer_ros_msgs::LandmarkEntry entry;
-      entry.id = reflectors_[associations[i]].id;
+      entry.id = reflector_map_->reflectors()[associations[i]].id;
       entry.tracking_from_landmark_transform.position.x = detections[i].x;
       entry.tracking_from_landmark_transform.position.y = detections[i].y;
-      entry.tracking_from_landmark_transform.position.z = 0.;
+      entry.tracking_from_landmark_transform.position.z = detections[i].z;
       entry.tracking_from_landmark_transform.orientation.w = 1.;
       entry.translation_weight = translation_weight_;
       entry.rotation_weight = rotation_weight_;
@@ -596,6 +412,7 @@ class ReflectorLandmarkNode {
       marker.action = visualization_msgs::Marker::ADD;
       marker.pose.position.x = detections[i].x;
       marker.pose.position.y = detections[i].y;
+      marker.pose.position.z = detections[i].z;
       marker.pose.orientation.w = 1.;
       marker.scale.x = detection_marker_scale_;
       marker.scale.y = detection_marker_scale_;
@@ -618,8 +435,8 @@ class ReflectorLandmarkNode {
     clear.action = visualization_msgs::Marker::DELETEALL;
     marker_array.markers.push_back(clear);
 
-    for (std::size_t i = 0; i < reflectors_.size(); ++i) {
-      const Reflector& reflector = reflectors_[i];
+    for (std::size_t i = 0; i < reflector_map_->reflectors().size(); ++i) {
+      const Reflector& reflector = reflector_map_->reflectors()[i];
       visualization_msgs::Marker sphere;
       sphere.header.frame_id = map_frame_;
       sphere.header.stamp = stamp;
@@ -664,26 +481,52 @@ class ReflectorLandmarkNode {
           1., "LaserScan intensities are empty or do not match ranges.");
       return;
     }
+    if (!std::isfinite(scan->time_increment) || scan->time_increment < 0.f ||
+        (scan->time_increment > 0.f && scan->header.stamp.isZero())) {
+      ROS_WARN_THROTTLE(1., "Ignoring LaserScan with invalid beam timestamps.");
+      return;
+    }
 
-    const std::vector<ReflectorDetection> detections = detector_->Detect(*scan);
+    std::vector<ReflectorDetection> detections;
+    tf2::Transform local_from_scan;
+    try {
+      UpdateMapFrame();
+      detections = DetectDeskewed(*scan, &local_from_scan);
+    } catch (const tf2::TransformException& error) {
+      if (mapping_mode_) {
+        reflector_map_->AgePendingTracks();
+      }
+      ROS_WARN_THROTTLE(1., "Cannot transform/deskew reflectors: %s",
+                        error.what());
+      return;
+    }
     if (detections.empty()) {
       if (mapping_mode_) {
-        AgePendingTracks();
+        reflector_map_->AgePendingTracks();
       }
       PublishDetectionMarkers(*scan, detections, {});
       return;
     }
 
-    std::vector<MapPoint> map_points;
-    if (!TransformToMap(*scan, detections, &map_points)) {
-      PublishDetectionMarkers(
-          *scan, detections, std::vector<int>(detections.size(), -1));
+    if (mapping_mode_ && waiting_for_optimized_map_) {
+      ROS_WARN_THROTTLE(1., "Waiting for optimized reflector coordinates.");
+      PublishDetectionMarkers(*scan, detections,
+                              std::vector<int>(detections.size(), -1));
       return;
     }
 
-    std::vector<int> associations = AssociateKnownReflectors(map_points);
+    std::vector<MapPoint> map_points;
+    map_points.reserve(detections.size());
+    const tf2::Transform map_from_scan = map_from_local_ * local_from_scan;
+    for (const auto& detection : detections) {
+      const tf2::Vector3 point =
+          map_from_scan * tf2::Vector3(detection.x, detection.y, detection.z);
+      map_points.push_back({point.x(), point.y()});
+    }
+    std::vector<int> associations =
+        reflector_map_->AssociateKnownReflectors(map_points);
     if (mapping_mode_) {
-      UpdateMapping(map_points, &associations);
+      reflector_map_->UpdateMapping(map_points, &associations);
     }
     PublishLandmarks(*scan, detections, associations);
     PublishDetectionMarkers(*scan, detections, associations);
@@ -701,14 +544,15 @@ class ReflectorLandmarkNode {
       return false;
     }
 
-    std::vector<Reflector> sorted_reflectors = reflectors_;
+    std::vector<Reflector> sorted_reflectors = reflector_map_->reflectors();
     std::sort(sorted_reflectors.begin(), sorted_reflectors.end(),
               [](const Reflector& lhs, const Reflector& rhs) {
                 return lhs.id < rhs.id;
               });
     output << std::setprecision(17);
     output << "map_frame: \"" << EscapeYamlString(map_frame_) << "\"\n";
-    output << "reflectors:\n";
+    output << (sorted_reflectors.empty() ? "reflectors: []\n"
+                                         : "reflectors:\n");
     for (const auto& reflector : sorted_reflectors) {
       output << "  - id: \"" << EscapeYamlString(reflector.id) << "\"\n"
              << "    x: " << reflector.x << "\n"
@@ -728,7 +572,8 @@ class ReflectorLandmarkNode {
     std::string error;
     response.success = SaveReflectorMap(&error);
     if (response.success) {
-      response.message = "Saved " + std::to_string(reflectors_.size()) +
+      response.message = "Saved " +
+                         std::to_string(reflector_map_->reflectors().size()) +
                          " reflectors to '" + map_file_ + "'.";
       ROS_INFO_STREAM(response.message);
     } else {
@@ -745,10 +590,10 @@ class ReflectorLandmarkNode {
 
   ReflectorDetectorOptions detector_options_;
   std::unique_ptr<ReflectorDetector> detector_;
-  std::vector<Reflector> reflectors_;
-  std::vector<PendingTrack> pending_tracks_;
+  std::unique_ptr<ReflectorMap> reflector_map_;
 
   ros::Subscriber scan_subscriber_;
+  ros::Subscriber optimized_landmark_subscriber_;
   ros::Publisher landmark_publisher_;
   ros::Publisher detection_marker_publisher_;
   ros::Publisher map_marker_publisher_;
@@ -759,10 +604,16 @@ class ReflectorLandmarkNode {
   std::string scan_topic_;
   std::string landmark_topic_;
   std::string map_frame_;
+  std::string local_frame_;
+  std::string optimized_landmark_topic_;
+  tf2::Transform map_from_local_;
+  bool have_map_frame_ = false;
+  bool waiting_for_optimized_map_ = false;
+  ros::Time map_correction_stamp_;
+  ros::Time optimized_map_stamp_;
   std::string map_file_;
   std::string id_prefix_;
   int id_width_ = 4;
-  int next_reflector_id_ = 0;
   bool save_on_shutdown_ = true;
 
   double association_distance_ = 0.3;

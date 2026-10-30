@@ -2,13 +2,17 @@
 
 `reflector_landmark` is an external ROS1 package that detects high-intensity
 laser reflectors and sends them to the existing Cartographer landmark input.
-It does not modify `cartographer` or `cartographer_ros`.
+It uses the existing Cartographer landmark input. Mapping also requires the
+small bundled `cartographer_ros/map_builder_bridge.cc` change: optimized
+landmark markers carry their original string IDs in `marker.text`, and all
+markers in a snapshot share one timestamp. Rebuild `cartographer_ros` together
+with this package. The Cartographer optimization algorithm is unchanged.
 
 ## Data flow
 
 ```text
 sensor_msgs/LaserScan
-  -> intensity filter and clustering
+  -> intensity filter, per-beam motion compensation and clustering
   -> map-frame data association
   -> cartographer_ros_msgs/LandmarkList
   -> /landmark
@@ -31,12 +35,21 @@ catkin_make_isolated --install --use-ninja
 source install_isolated/setup.bash
 ```
 
-The package builds three targets:
+The package builds the detector/association libraries and these executables:
 
 - `reflector_landmark_node`: detector, associator and landmark publisher.
 - `reflector_map_exporter`: exports optimized landmark positions from a
   pbstream into the YAML format consumed by the node.
 - `reflector_detector_test`: detector unit tests when testing is enabled.
+- `reflector_regression_test`: ID association, optimized-map synchronization,
+  split-cluster and motion-compensation regression tests.
+
+Run the regression executable after building with testing enabled:
+
+```bash
+cd build_isolated/reflector_landmark
+ctest -R reflector_regression_test --output-on-failure
+```
 
 ## Cartographer configuration
 
@@ -93,8 +106,29 @@ roslaunch reflector_landmark reflector_mapping.launch \
   map_file:=/tmp/reflector_map_online.yaml
 ```
 
-The node needs a valid `map -> <laser frame>` transform at the scan timestamp.
-It deliberately publishes no landmark when that transform is unavailable.
+The node needs a continuous `local_frame` (default `odom`), TF from that frame
+to the laser at every reflective beam's acquisition time, and the latest
+`map_frame -> local_frame` correction. The supplied Lua examples provide this
+TF chain. If an external odometry publisher is used, ensure it owns the
+continuous local frame. A moving robot frame or `map` itself is unsuitable.
+
+Each accepted beam is transformed using `header.stamp + index * time_increment`
+and deskewed into the laser frame at scan start, before clustering. Both
+published landmarks and detection markers therefore retain the original scan
+header. A zero `time_increment` is treated as an instantaneous scan. Missing TF
+causes the scan to be skipped, with no partially compensated observations.
+
+In mapping mode the node subscribes to `optimized_landmark_topic` (default
+`/landmark_poses_list`) and updates coordinates by string ID. After a global
+TF correction it pauses association until a current optimized snapshot is
+available. Pending confirmations and new landmarks without optimized poses are
+rebased together with the global correction; only candidates overlapping an
+existing optimized landmark are suppressed, so optimization does not prevent
+unrelated new landmarks from being confirmed.
+Already optimized landmarks keep their authoritative pose until the next
+snapshot. Ambiguous matches are suppressed without publishing an arbitrary ID.
+An unmodified Cartographer publisher with unnamed markers is rejected with an
+error rather than used as an association map.
 
 Save the online association map on demand:
 
@@ -146,7 +180,10 @@ RANSAC initialization is intentionally not performed by this package.
 Inputs:
 
 - `scan_topic` (`sensor_msgs/LaserScan`), default `scan`.
-- TF from the scan frame to `map_frame` at the scan timestamp.
+- TF from the scan frame to `local_frame` at beam acquisition times, and the
+  latest `map_frame -> local_frame` correction.
+- `optimized_landmark_topic` (`visualization_msgs/MarkerArray`) in mapping mode,
+  with IDs in `marker.text` from the bundled Cartographer ROS change.
 - private `reflectors` parameter in localization mode.
 
 Outputs:

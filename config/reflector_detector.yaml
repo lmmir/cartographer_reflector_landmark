@@ -13,11 +13,15 @@ detection_merge_distance: 0.10
 
 # Association is performed in map_frame.
 map_frame: map
+# A continuous local frame, also used for per-beam motion compensation.
+local_frame: odom
+# Requires the bundled cartographer_ros marker.text/string-ID change.
+optimized_landmark_topic: /landmark_poses_list
 association_distance: 0.30
 association_margin: 0.05
 pending_association_distance: 0.20
 # Physical reflectors must be spaced farther apart than this value. Nearby
-# candidates reuse the oldest ID and can never create a second landmark.
+# candidates are suppressed; suppression never assigns an ambiguous ID.
 duplicate_suppression_distance: 0.15
 minimum_confirmations: 8
 maximum_pending_missed_scans: 5

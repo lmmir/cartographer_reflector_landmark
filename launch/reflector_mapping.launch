@@ -1,6 +1,8 @@
 <launch>
   <arg name="scan_topic" default="/scan" />
   <arg name="landmark_topic" default="/landmark" />
+  <arg name="local_frame" default="odom" />
+  <arg name="optimized_landmark_topic" default="/landmark_poses_list" />
   <arg name="map_file" default="/tmp/reflector_map.yaml" />
   <arg name="detector_config"
        default="$(find reflector_landmark)/config/reflector_detector.yaml" />
@@ -11,6 +13,8 @@
     <param name="mode" value="mapping" />
     <param name="scan_topic" value="$(arg scan_topic)" />
     <param name="landmark_topic" value="$(arg landmark_topic)" />
+    <param name="local_frame" value="$(arg local_frame)" />
+    <param name="optimized_landmark_topic" value="$(arg optimized_landmark_topic)" />
     <param name="map_file" value="$(arg map_file)" />
     <param name="save_on_shutdown" value="true" />
   </node>
